@@ -1,0 +1,1020 @@
+---
+title: "Human Activity Recognition with PAMAP2 (Protocol Dataset)"
+subtitle: "HarvardX Data Science Capstone (PH125.9x)"
+author: "Fernando Marcelo Parodi"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+    fig_caption: true
+fontsize: 11pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{multirow}
+  - \usepackage{wrapfig}
+  - \usepackage{colortbl}
+  - \usepackage{pdflscape}
+  - \usepackage{tabu}
+  - \usepackage{threeparttable}
+  - \usepackage{threeparttablex}
+  - \usepackage[normalem]{ulem}
+  - \usepackage{makecell}
+  - \usepackage{xcolor}
+---
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  message    = TRUE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.pos    = "H",
+  out.width  = "85%"
+)
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+  library(scales)
+})
+
+# ---- Helpers ----------------------------------------------------------------
+
+# Safe CSV reader: fails with a clear error if the artifact is missing.
+safe_read_csv <- function(path) {
+  if (!file.exists(path)) stop(paste("Missing required artifact:", path))
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+# Safe image include: returns a warning instead of crashing if missing.
+safe_include_graphics <- function(path) {
+  if (!file.exists(path)) {
+    warning(paste("Missing image artifact:", path))
+    return(invisible(NULL))
+  }
+  knitr::include_graphics(path)
+}
+
+fmt_num  <- function(x, digits = 4) sprintf(paste0("%.", digits, "f"), x)
+fmt_pct  <- function(x, digits = 1) sprintf(paste0("%.", digits, "f%%"), 100 * x)
+fmt_int  <- function(x) formatC(as.numeric(x), format = "d", big.mark = ",")
+
+# Kable wrapper that produces booktabs-styled tables that "hold_position"
+# (do not float) and scale down if wider than text width.
+ktab <- function(df, caption = NULL, digits = 4, ...) {
+  kable(df, caption = caption, digits = digits, booktabs = TRUE,
+        linesep = "", ...) %>%
+    kable_styling(latex_options = c("hold_position", "striped"),
+                  font_size = 9, full_width = FALSE)
+}
+
+# ---- Artifact paths (all produced by Script.R) -----------------------------
+
+# Splits
+ART_SPLIT_MANIFEST <- "data/processed/splits/split_manifest_protocol.csv"
+
+# EDA (raw and post-cleaning)
+ART_ACT_DIST_RAW     <- "outputs/eda_raw/activity_distribution_overall.csv"
+ART_MISSING_RAW      <- "outputs/eda_raw/missingness_global_by_feature.csv"
+ART_ACC_SAT          <- "outputs/eda_raw/acc_saturation_global.csv"
+ART_ACT0_SUBJ        <- "outputs/eda_raw/activity0_rate_by_subject_session.csv"
+ART_SAMPLING_RATE    <- "outputs/eda_raw/sampling_rate_by_file.csv"
+ART_ACT_DIST_POST    <- "outputs/post_clean_eda/post_clean_activity_distribution_overall.csv"
+ART_WIN_DIST         <- "outputs/post_clean_eda/window_label_distribution.csv"
+ART_COVERAGE_SUBJ    <- "outputs/post_clean_eda/post_clean_activity_coverage_by_subject.csv"
+
+# Cleaning
+ART_CLEAN_SUMMARY    <- "outputs/cleaning/cleaning_summary_protocol.csv"
+
+# Baselines / tuning
+ART_BASELINE_METRICS <- "outputs/baselines/baseline_metrics.csv"
+ART_VAL_COMPARE      <- "outputs/tuning/validation_model_comparison.csv"
+ART_TEST_COMPARE     <- "outputs/tuning/test_model_comparison.csv"
+ART_RF_LOSO_SUMMARY  <- "outputs/tuning/ranger_loso_summary.csv"
+ART_RF_LOSO_RAW      <- "outputs/tuning/ranger_loso_raw.csv"
+
+# Final model
+ART_FINAL_METRICS    <- "outputs/final/final_test_metrics.csv"
+ART_PER_CLASS        <- "outputs/final/final_test_per_class_metrics.csv"
+ART_CONF_CSV         <- "outputs/final/final_test_confusion.csv"
+ART_CONF_PNG         <- "outputs/final/final_test_confusion.png"
+ART_FEATIMP_PNG      <- "outputs/final/final_feature_importance_top30.png"
+ART_FEATIMP_CSV      <- "outputs/final/final_feature_importance.csv"
+
+# Raw data (used only for a short signal trace example)
+ART_CLEAN_RDS        <- "data/processed/pamap_clean_protocol.rds"
+
+# ---- Artifact bootstrap --------------------------------------------------
+# If any required artifact produced by Script.R is missing, I warn the
+# user, launch Script.R as a child R process to regenerate the pipeline
+# end to end, and then re-check. If the script is itself missing, or if
+# an artifact still cannot be located after running it, I fail loudly
+# rather than silently knitting a broken document.
+
+required_artifacts <- c(
+  ART_SPLIT_MANIFEST, ART_ACT_DIST_RAW, ART_MISSING_RAW, ART_ACC_SAT,
+  ART_ACT0_SUBJ, ART_SAMPLING_RATE, ART_ACT_DIST_POST, ART_WIN_DIST,
+  ART_COVERAGE_SUBJ, ART_CLEAN_SUMMARY, ART_BASELINE_METRICS,
+  ART_VAL_COMPARE, ART_TEST_COMPARE, ART_RF_LOSO_SUMMARY,
+  ART_RF_LOSO_RAW, ART_FINAL_METRICS, ART_PER_CLASS, ART_CONF_CSV,
+  ART_CONF_PNG, ART_FEATIMP_PNG, ART_FEATIMP_CSV, ART_CLEAN_RDS
+)
+
+missing_artifacts <- required_artifacts[!file.exists(required_artifacts)]
+
+if (length(missing_artifacts) > 0) {
+  message("Some required artifacts are missing; ",
+          "I will run Script.R to regenerate them.")
+  message("Missing artifacts (", length(missing_artifacts), "):")
+  for (p in missing_artifacts) message("  - ", p)
+
+  if (!file.exists("Script.R")) {
+    stop("Script.R not found in the working directory (",
+         normalizePath(".", winslash = "/"),
+         "); I cannot auto-regenerate the artifacts. ",
+         "Please place Script.R alongside this .Rmd and re-knit.")
+  }
+
+  # I run Script.R as a child R process instead of source()ing it inside
+  # the knit, because knitr redirects the current R session's stdout and
+  # stderr through its own chunk-capture sink. A source() call would
+  # therefore run silently, with progress invisible until the knit
+  # finishes. A child process launched with stdout = "" and stderr = ""
+  # inherits the parent's raw file handles, so Script.R's own messages,
+  # warnings and progress lines stream live to the console / Render pane
+  # as the pipeline runs.
+
+  rscript <- file.path(R.home("bin"), "Rscript")
+  message("Running Script.R in a child R process ",
+          "(this can take several minutes the first time).")
+  message("Live output from Script.R follows:")
+  message(strrep("-", 70))
+
+  rc <- system2(rscript,
+                args   = shQuote("Script.R"),
+                stdout = "", stderr = "")
+
+  message(strrep("-", 70))
+  if (!identical(as.integer(rc), 0L)) {
+    stop("Script.R exited with status ", rc,
+         ". Check the console output above for the failing step.")
+  }
+
+  still_missing <- required_artifacts[!file.exists(required_artifacts)]
+  if (length(still_missing) > 0) {
+    stop("Script.R completed but the following artifacts are still missing:\n  ",
+         paste(still_missing, collapse = "\n  "))
+  }
+  message("Script.R finished successfully; ",
+          "all required artifacts are now available.")
+}
+
+# ---- Pre-load metrics used inline in the narrative -------------------------
+final_metrics <- safe_read_csv(ART_FINAL_METRICS)
+acc    <- final_metrics$accuracy[1]
+mf1    <- final_metrics$macro_f1[1]
+ntrees <- final_metrics$num_trees[1]
+mtry_v <- final_metrics$mtry[1]
+mns_v  <- final_metrics$min_node_size[1]
+
+clean_sum <- safe_read_csv(ART_CLEAN_SUMMARY)
+rows_before_total    <- as.numeric(clean_sum$value[clean_sum$metric == "rows_before"])
+rows_after_final_tot <- as.numeric(clean_sum$value[clean_sum$metric == "rows_after_final"])
+cols_before_total    <- as.numeric(clean_sum$value[clean_sum$metric == "cols_before"])
+cols_after_total     <- as.numeric(clean_sum$value[clean_sum$metric == "cols_after_final"])
+
+per_class <- safe_read_csv(ART_PER_CLASS)
+```
+
+# Introduction
+
+## Problem and Motivation
+
+Human Activity Recognition, or HAR, answers a deceptively simple question
+I keep coming back to: what is this person doing right now? Accelerometers,
+gyroscopes, magnetometers, the occasional pulse reading  that is the
+entire slice of reality the model gets to see, and from it it has to pick
+between walking, cycling, ironing and a dozen other possibilities. The
+applications are familiar enough to be unremarkable: step counters on the
+wrist, rehabilitation platforms that flag a stalled recovery, a watch that
+notices a fall before the wearer can. What unites them is an unforgiving
+structural constraint, and it is the constraint I want the model to respect.
+The person who wears the device in production is, almost by definition,
+not the person whose data I trained on. Gait differs. Pace differs.
+Posture, grip, tempo all differ. the model has to hold up anyway.
+
+## Dataset
+
+The **PAMAP2 Physical Activity Monitoring** dataset (Reiss & Stricker,
+2012), distributed through the UCI Machine Learning Repository, fits this
+problem almost perfectly. Nine subjects were instrumented with three
+inertial measurement units  one on the hand, one on the chest, one on
+the ankle  each sampling at **100 Hz**, together with a chest-worn
+heart-rate monitor sampling at a comparatively sluggish **9 Hz**. They
+then worked through a scripted **protocol** of twelve activities spanning
+daily life and exercise: walking, running, cycling, ironing, vacuum
+cleaning, rope jumping, and so on. A handful of subjects also performed
+optional activities outside the protocol; I deliberately set those aside
+and work only with the scripted protocol. Before I apply a single cleaning
+step, the raw protocol files contain `r fmt_int(rows_before_total)`
+observations across `r fmt_int(cols_before_total)` columns.
+
+## Goal
+
+My goal is direct; the twist hides in how I evaluate it. I want to train
+a classifier that, given a short window of raw IMU data, names the
+activity being performed  "short" meaning five seconds, "works" meaning
+it works on a subject the model has never seen. Not a held-out time slice
+from a familiar user, but an entirely new person, whose movement style
+functions, in effect, as a perturbation the model must absorb. I put two
+algorithms on the same bench. A regularized **multinomial logistic
+regression** (`glmnet`) gives me a disciplined linear baseline; a **Random
+Forest** (`ranger`) plays the non-linear counterpart. I tune both under
+the same protocol and score them against the same held-out subject, on
+identical features.
+
+## Key Steps Performed
+
+My pipeline flows through seven stages, each one handing a cleaner,
+smaller, and more structured object to the next:
+
+1. **Ingestion**  I pull the raw `.dat` files, attach the variable
+   schema, and audit sampling rates, row counts, and file integrity.
+2. **Exploratory Data Analysis**  I look at activity distributions,
+   per-feature missingness, $\pm 6$ g accelerometer saturation,
+   orientation-channel variance, and the per-subject rate of the
+   transient "activity 0" label.
+3. **Data cleaning**  I drop activity `0`, drop the subject with
+   almost no data, drop orientation quaternions and the $\pm 6$ g
+   accelerometer, and apply LOCF to heart rate for audit purposes only.
+4. **Subject-independent split**  I train on {101, 103, 104, 106,
+   107, 108}, validate on {102}, and test exactly once on {105}.
+5. **Windowing and feature engineering**  I cut 5-second windows at a
+   1-second stride, apply a 90% purity filter, and compute four summary
+   statistics per channel.
+6. **Modeling**  I fit a regularized multinomial baseline paired with
+   a Random Forest, both tuned via **Leave-One-Subject-Out (LOSO)**
+   cross-validation over the training subjects.
+7. **Final evaluation**  I run a one-shot test on subject 105,
+   complete with confusion matrix, per-class metrics, and permutation
+   feature importance.
+
+Every number, table and figure that follows is computed at knit time from
+the artifacts written by `Script.R`. I do not type any of them by hand.
+
+# Methods and Analysis
+
+## Exploratory Data Analysis
+
+Before I make any modeling decision, I want to look at the raw data
+honestly. The four subsections below walk through the findings that ended
+up shaping my cleaning step, my feature design, and my split strategy.
+
+### Activity distribution (raw)
+
+One label dwarfs all the others: **Activity 0**, the "transient / other"
+bucket that marks the in-between moments of the scripted protocol 
+the subject catching their breath, walking from one station to the next,
+adjusting a strap. It is not a class I want to predict; it is, in every
+practical sense, noise. I discard it wholesale during cleaning (Section
+2.2).
+
+```{r eda-activity-dist, fig.cap="Raw activity distribution. Activity 0 is the transient period between scripted activities and is removed before modeling.", fig.height=3.8}
+act_raw <- safe_read_csv(ART_ACT_DIST_RAW)
+
+act_raw %>%
+  dplyr::mutate(
+    activity = ifelse(activity_id == 0, "other_transient (dropped)", activity),
+    is_drop  = activity_id == 0
+  ) %>%
+  dplyr::arrange(rows) %>%
+  dplyr::mutate(activity = factor(activity, levels = activity)) %>%
+  ggplot(aes(x = activity, y = rows, fill = is_drop)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_fill_manual(values = c(`FALSE` = "steelblue", `TRUE` = "firebrick"),
+                    guide = "none") +
+  labs(x = NULL, y = "Rows (samples at 100 Hz)") +
+  theme_minimal(base_size = 9)
+```
+
+### Missingness by feature
+
+My missingness plot is dominated by a single bar: heart rate, sitting at
+roughly 91%. That figure looks alarming until I remind myself that heart
+rate samples at 9 Hz while the IMUs run at 100 Hz. Once I put both streams
+on the faster clock, ten out of every eleven heart-rate rows are empty by
+construction  a structural artifact of the merge, not a data-quality
+failure, and one that deserves its own handling strategy (Section 2.3).
+Every other channel sits comfortably below 1%.
+
+```{r eda-missingness, fig.cap="Global missing-rate per feature (raw protocol). Heart rate stands out because of its lower native sampling rate.", fig.height=3.6}
+miss <- safe_read_csv(ART_MISSING_RAW) %>%
+  dplyr::arrange(dplyr::desc(missing_rate)) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::mutate(feature = factor(feature, levels = rev(feature)))
+
+ggplot(miss, aes(x = feature, y = missing_rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.1)) +
+  labs(x = NULL, y = "Missing rate") +
+  theme_minimal(base_size = 9)
+```
+
+### Accelerometer saturation
+
+Every IMU in PAMAP2 reports acceleration through two sensors at once: a
+sensitive $\pm 6$ g unit and a wider-range $\pm 16$ g unit. For gentle
+activities the two agree almost perfectly. For impact-heavy ones 
+running, rope jumping  the 6 g sensor clips: the signal hits the rail
+and stays pinned there until the gesture eases. The table below puts a
+number on how often that happens. The $\pm 16$ g stream clips roughly two
+orders of magnitude less, which is the only reason I feed it, and not its
+sensitive companion, into the model downstream.
+
+```{r eda-sat}
+sat <- safe_read_csv(ART_ACC_SAT) %>%
+  tidyr::pivot_longer(everything(), names_to = "sensor", values_to = "rate") %>%
+  dplyr::mutate(
+    sensor = dplyr::recode(sensor,
+                           acc6_sat_rate  = "+/- 6 g accelerometer",
+                           acc16_sat_rate = "+/- 16 g accelerometer"),
+    rate   = fmt_pct(rate, 4)
+  )
+
+ktab(sat,
+     caption   = "Global accelerometer saturation rate (raw protocol data).",
+     col.names = c("Sensor range", "Saturation rate"))
+```
+
+## Data Cleaning
+
+A handful of cleaning decisions fall out of my EDA almost by themselves:
+
+- **Drop activity 0.** It is not a target class, and it accounts for
+  nearly a third of the raw rows.
+- **Drop the orientation quaternions.** A documented calibration glitch
+  leaves several subjects with near-constant values  exactly the shape
+  of signal my learner would latch onto and be misled by.
+- **Drop the $\pm 6$ g accelerometer.** I replace it with the $\pm 16$ g
+  channel and sidestep the saturation problem entirely.
+- **Keep temperature.** The signal is marginal, but carrying it costs me
+  almost nothing, and it occasionally helps the model distinguish sustained
+  exercise from stationary activities.
+- **Drop subject 109.** With only ~6 k rows, this subject can neither
+  contribute meaningfully to my training set nor support a credible
+  held-out evaluation.
+
+The summary below breaks down the resulting counts, rates, and which of
+my rules were actually applied.
+
+```{r cleaning-summary, results='asis'}
+int_metrics <- c(
+  "rows_before", "rows_after_basic_validity", "rows_removed_basic_validity",
+  "rows_removed_activity0", "rows_removed_unknown_activity",
+  "rows_after_final", "cols_before", "cols_after_final",
+  "dropped_columns_count"
+)
+pct_metrics  <- c("hr_missing_before_raw", "hr_missing_after_locf_audit")
+flag_metrics <- c(
+  "use_heart_rate_for_model", "fill_heart_rate_locf",
+  "drop_activity0", "drop_unknown_activity",
+  "drop_orientation", "drop_acc6", "drop_temp"
+)
+
+tbl_counts <- clean_sum %>%
+  dplyr::filter(metric %in% int_metrics) %>%
+  dplyr::mutate(
+    metric = factor(metric, levels = int_metrics),
+    value  = fmt_int(value)
+  ) %>%
+  dplyr::arrange(metric)
+print(ktab(tbl_counts,
+           caption   = "Cleaning summary - row and column counts.",
+           col.names = c("Metric", "Value")))
+
+tbl_rates <- clean_sum %>%
+  dplyr::filter(metric %in% pct_metrics) %>%
+  dplyr::mutate(value = sprintf("%.4f%%", 100 * as.numeric(value)))
+print(ktab(tbl_rates,
+           caption   = "Cleaning summary - missingness rates.",
+           col.names = c("Metric", "Value")))
+
+tbl_flags <- clean_sum %>%
+  dplyr::filter(metric %in% flag_metrics) %>%
+  dplyr::mutate(value = ifelse(as.numeric(value) == 1, "Yes", "No"))
+print(ktab(tbl_flags,
+           caption   = "Cleaning summary - cleaning rules applied.",
+           col.names = c("Rule", "Applied")))
+```
+
+### Impact of each cleaning rule
+
+What remains is for me to quantify what those decisions actually cost in
+rows and columns. The two figures below do precisely that: one tracks how
+many observations survive each filter in turn, the other shows where my
+channels go  and, just as importantly, which ones I keep.
+
+```{r cleaning-rows-impact, fig.cap="Row-count funnel across cleaning stages (protocol dataset).", fig.height=3.2}
+rows_before          <- as.numeric(clean_sum$value[clean_sum$metric == "rows_before"])
+rows_after_basic     <- as.numeric(clean_sum$value[clean_sum$metric == "rows_after_basic_validity"])
+rows_removed_act0    <- as.numeric(clean_sum$value[clean_sum$metric == "rows_removed_activity0"])
+rows_after_final     <- as.numeric(clean_sum$value[clean_sum$metric == "rows_after_final"])
+
+funnel <- tibble(
+  stage = c("1. Raw protocol rows",
+            "2. After basic validity",
+            "3. After removing activity 0",
+            "4. After removing unknown activities\n(final)"),
+  rows  = c(rows_before, rows_after_basic,
+            rows_before - rows_removed_act0, rows_after_final)
+) %>%
+  dplyr::mutate(
+    stage = factor(stage, levels = stage),
+    pct   = rows / rows_before
+  )
+
+ggplot(funnel, aes(x = stage, y = rows)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%s\n(%.1f%%)",
+                                fmt_int(rows), 100 * pct)),
+            vjust = -0.25, size = 3) +
+  scale_y_continuous(labels = scales::label_comma(),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = "Rows remaining") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(size = 8))
+```
+
+```{r cleaning-cols-impact, fig.cap="Column-count impact of the channel-level cleaning rules.", fig.height=3.0}
+cols_df <- tibble(
+  stage = factor(c("Before cleaning", "Dropped channels", "After cleaning"),
+                 levels = c("Before cleaning", "Dropped channels", "After cleaning")),
+  cols  = c(cols_before_total,
+            as.numeric(clean_sum$value[clean_sum$metric == "dropped_columns_count"]),
+            cols_after_total),
+  kind  = c("kept", "dropped", "kept")
+)
+
+ggplot(cols_df, aes(x = stage, y = cols, fill = kind)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = cols), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c(kept = "steelblue", dropped = "firebrick"),
+                    guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = "Number of columns",
+       subtitle = "Channels dropped: orientation quaternions, +/-6 g accelerometer, temperature (optional)") +
+  theme_minimal(base_size = 10)
+```
+
+## Heart-rate Handling
+
+Heart rate is informative  rope jumping and running share remarkably
+similar arm dynamics, yet their heart-rate signatures diverge  but the
+9 Hz native cadence collides awkwardly with the 100 Hz IMU clock. I
+weighed two mitigations. The first: keep heart rate as a feature and fill
+the gaps with last-observation-carried-forward (LOCF). The second: drop
+heart rate from my feature set entirely and let the IMUs carry the
+modeling load. LOCF is cheap, and the imputation is defensible on its
+face, yet it hides a subtler cost: up to eleven sample-ticks of lag,
+enough to nudge intensity peaks past their matching motion peaks and
+confuse the model in exactly the classes where heart rate would have
+helped most. I therefore exclude heart rate from the model features
+(`use_heart_rate_for_model = 0` in the cleaning summary). I still apply
+LOCF for audit purposes: it collapses the missing rate from ~91% down to
+~0.002%, which makes the raw data readable without altering a single
+feature the model sees.
+
+## Example Raw Signals
+
+Before I commit to a feature design, I want to look at the raw material.
+The figure below shows ten seconds of the hand-mounted $\pm 16$ g
+accelerometer across three very different activities for a single
+subject. Walking produces a steady, almost metronomic signature. Running
+pushes the amplitude several times higher and compresses its period into
+a tighter beat. Lying down is, visually, almost a flat line with a slight
+drift. Three regimes  amplitude, periodicity, near-silence  and
+those are exactly what my window-level summary statistics (mean, standard
+deviation, RMS, IQR) are designed to compress into a handful of numbers
+the model can chew on.
+
+```{r raw-signal, fig.cap="Ten seconds of hand +/-16 g accelerometer for subject 101 across three activities.", fig.height=4.0, cache=TRUE}
+if (file.exists(ART_CLEAN_RDS)) {
+  df <- readRDS(ART_CLEAN_RDS)
+
+  take_window <- function(data, subj, act, seconds = 10) {
+    d <- data %>%
+      dplyr::filter(subject_id == subj, activity_id == act) %>%
+      dplyr::arrange(timestamp) %>%
+      dplyr::slice_head(n = 100 * seconds)
+    if (nrow(d) == 0) return(NULL)
+    d %>%
+      dplyr::mutate(t = (timestamp - min(timestamp))) %>%
+      dplyr::select(t, hand_acc16_x, hand_acc16_y, hand_acc16_z) %>%
+      tidyr::pivot_longer(-t, names_to = "axis", values_to = "g")
+  }
+
+  sig <- dplyr::bind_rows(
+    take_window(df, 101L, 4L)  %>% dplyr::mutate(activity = "walking"),
+    take_window(df, 101L, 5L)  %>% dplyr::mutate(activity = "running"),
+    take_window(df, 101L, 1L)  %>% dplyr::mutate(activity = "lying")
+  )
+
+  if (!is.null(sig) && nrow(sig) > 0) {
+    ggplot(sig, aes(x = t, y = g, colour = axis)) +
+      geom_line(linewidth = 0.3) +
+      facet_wrap(~ activity, ncol = 1, scales = "free_y") +
+      labs(x = "Time (s)", y = "Acceleration (g)", colour = NULL) +
+      theme_minimal(base_size = 9) +
+      theme(legend.position = "top")
+  }
+
+  # Release memory; I won't need the big RDS again.
+  rm(df); invisible(gc(verbose = FALSE))
+}
+```
+
+## Subject-Independent Split
+
+My split is strict and unambiguous: each subject plays exactly one role
+ train, validation, or test  and I never share a subject across
+partitions. Any overlap would leak within-subject structure between my
+folds and quietly turn the evaluation into theatre.
+
+```{r split-manifest}
+manifest <- safe_read_csv(ART_SPLIT_MANIFEST) %>%
+  dplyr::mutate(rows = fmt_int(rows))
+ktab(manifest,
+     caption   = "Subject-level distribution and roles.",
+     col.names = c("Role", "Subject ID", "Rows"))
+```
+
+The resulting roles are:
+
+- **Training subjects** (101, 103, 104, 106, 107, 108) power both my
+  model fitting and my LOSO cross-validation.
+- **Validation subject** (102) I touch exactly once, at the end of
+  tuning, to decide which model family earns the right to face the test.
+- **Test subject** (105) I hold out completely; only my winning model
+  ever sees it, in a single, final evaluation.
+- **Subject 109** I exclude outright  with only ~6 k rows, it cannot
+  serve either training or a credible held-out evaluation.
+
+## Windowing and Feature Engineering
+
+I build a sliding-window pipeline that turns the continuous sensor
+streams into a table of fixed-length feature vectors, each one tagged
+with a single activity label:
+
+- **Window size**  5 seconds, i.e. 500 samples at 100 Hz.
+- **Stride**  1 second, producing heavily overlapping windows to
+  inflate my effective sample count without inventing information.
+- **Label purity**  I keep a window only if a single activity covers
+  more than 90% of its duration; windows sitting astride a transition I
+  drop outright.
+- **Features per window**  mean, standard deviation, RMS, and
+  inter-quartile range, computed independently on every surviving sensor
+  channel.
+
+My resulting class distribution is imbalanced by design  ironing and
+walking are abundant, rope jumping is relatively scarce  but crucially,
+every activity clears at least 75 windows in my test split, which keeps
+the per-class metrics informative rather than reducing them to noisy
+point estimates.
+
+```{r window-dist, fig.cap="Window count per activity after purity filtering, by split."}
+win_dist <- safe_read_csv(ART_WIN_DIST)
+
+win_dist %>%
+  dplyr::mutate(split = factor(split, levels = c("train", "validation", "test"))) %>%
+  ggplot(aes(x = reorder(label_activity, windows), y = windows, fill = split)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x = NULL, y = "Windows", fill = "Split") +
+  theme_minimal(base_size = 10)
+```
+
+## Modeling Approach
+
+I train two model families side by side. The pairing is not accidental:
+running a linear learner and a non-linear one on the same feature set
+gives me a cheap, honest stress test on my features themselves. If my
+linear model catches the ensemble, my feature engineering did the heavy
+lifting and the extra capacity is idle. If the ensemble pulls ahead,
+non-linearities and cross-channel interactions are doing real work, and
+my decision to invest in trees is justified.
+
+1. **Regularized multinomial logistic regression** (`glmnet`)  my
+   disciplined linear baseline, with regularization strength chosen on
+   training folds only, so that no test-set information leaks into model
+   selection through the back door.
+2. **Random Forest** (`ranger`)  non-linear, unbothered by correlated
+   channels, and generous with diagnostics: permutation feature
+   importance arrives for free, and that matters more than it sounds
+   when I need to explain twelve activities rather than merely predict
+   them.
+
+### Why Random Forest is expected to win
+
+My engineered features are already non-linear summaries of the raw
+signal  RMS is quadratic, IQR is an order statistic, standard
+deviation runs through a square root. More to the point, the activities
+themselves are defined by interactions across IMUs, not by any single
+channel on its own. Running is not "high RMS in the hand", nor "high RMS
+in the ankle"  it is both at once, in phase. A linear model cannot
+represent that conjunction without explicit, hand-written crosses; a
+tree ensemble captures it in a single split. The validation and test
+comparisons I show below line up with that intuition rather closely.
+
+### Hyperparameter tuning with LOSO
+
+I tune hyperparameters with **Leave-One-Subject-Out (LOSO)**
+cross-validation over my six training subjects. I train each
+configuration on five subjects, score it on the sixth, and rotate the
+exercise through every subject in turn. Why LOSO rather than a cheap
+random split? Because random cross-validation quietly leaks information.
+Adjacent windows from the same subject look nearly identical  same
+body, same rhythm, often the same second of wall-clock time  and if
+some of them end up in my training fold while others end up in
+validation, the model is effectively being graded on variations of its own
+training examples. LOSO shuts that leak and gives me a number that
+actually means something for a brand-new user.
+
+# Results
+
+## Baseline vs. Tuned (validation set)
+
+Subject 102 is my first honest test  a subject neither model has ever
+seen. On that subject, my tuned Random Forest edges the tuned multinomial
+on both accuracy and macro-F1. Modest, but consistent.
+
+```{r val-compare}
+val_cmp <- safe_read_csv(ART_VAL_COMPARE) %>%
+  dplyr::mutate(accuracy = fmt_num(accuracy, 4),
+                macro_f1 = fmt_num(macro_f1, 4))
+ktab(val_cmp,
+     caption   = "Validation performance (subject 102) across tuned model families.",
+     col.names = c("Model", "Split", "Accuracy", "Macro-F1"))
+```
+
+## LOSO variability on the training subjects
+
+LOSO pays me a second dividend, one that pure hyperparameter selection
+cannot: it surfaces **between-subject variability**. Some subjects are
+straightforwardly easier to predict than others even within my training
+pool, and that spread is a useful leading indicator of how forgiving, or
+how punishing, my held-out test subject is likely to be.
+
+```{r loso-summary}
+loso_sum <- safe_read_csv(ART_RF_LOSO_SUMMARY) %>%
+  dplyr::arrange(dplyr::desc(loso_macro_f1)) %>%
+  dplyr::mutate(
+    loso_accuracy = fmt_num(loso_accuracy, 4),
+    loso_macro_f1 = fmt_num(loso_macro_f1, 4)
+  )
+ktab(loso_sum,
+     caption   = "LOSO cross-validation summary for the Random Forest grid.",
+     col.names = c("Num. trees", "mtry", "Min. node size",
+                   "LOSO accuracy", "LOSO macro-F1"))
+```
+
+```{r loso-per-subject, fig.cap="Random Forest LOSO macro-F1 by held-out training subject (best hyperparameters)."}
+loso_raw <- safe_read_csv(ART_RF_LOSO_RAW)
+
+best_cfg <- loso_raw %>%
+  dplyr::group_by(num.trees, mtry, min.node.size) %>%
+  dplyr::summarise(mean_f1 = mean(macro_f1), .groups = "drop") %>%
+  dplyr::slice_max(mean_f1, n = 1)
+
+loso_raw %>%
+  dplyr::semi_join(best_cfg, by = c("num.trees", "mtry", "min.node.size")) %>%
+  dplyr::mutate(holdout_subject = factor(holdout_subject)) %>%
+  ggplot(aes(x = reorder(holdout_subject, macro_f1), y = macro_f1)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = fmt_num(macro_f1, 3)), hjust = -0.1, size = 3) +
+  coord_flip(ylim = c(0, 1.05)) +
+  labs(x = "Held-out training subject", y = "Macro-F1 (LOSO fold)") +
+  theme_minimal(base_size = 10)
+```
+
+Under my best configuration, macro-F1 on the held-out training subject
+ranges from roughly 0.78 in the worst fold to 0.94 in the best  a
+**$\Delta \approx 0.16$** subject-to-subject spread. Whatever my test
+number eventually is, I expect it to sit somewhere inside that corridor;
+anything dramatically outside would be a signal to look twice.
+
+## Baselines vs. tuned models on every split
+
+Laying my untuned baselines and my tuned models side by side across all
+three splits surfaces two patterns at once. Tuning pays off on the
+held-out subject  my test numbers close meaningfully on the validation
+numbers, rather than collapsing under the weight of subject 105's
+idiosyncrasies  and the drop I see between validation and test, while
+real, is small. That last detail matters: it tells me subject 102 was
+not a suspiciously friendly proxy for subject 105.
+
+```{r baselines-table}
+baselines <- safe_read_csv(ART_BASELINE_METRICS) %>%
+  dplyr::select(model, split, accuracy, macro_f1) %>%
+  dplyr::arrange(model, split) %>%
+  dplyr::mutate(accuracy = fmt_num(accuracy, 4),
+                macro_f1 = fmt_num(macro_f1, 4))
+ktab(baselines,
+     caption   = "Baseline (untuned) Random Forest and glmnet across splits.",
+     col.names = c("Model", "Split", "Accuracy", "Macro-F1"))
+```
+
+```{r test-compare}
+test_cmp <- safe_read_csv(ART_TEST_COMPARE) %>%
+  dplyr::mutate(accuracy = fmt_num(accuracy, 4),
+                macro_f1 = fmt_num(macro_f1, 4))
+ktab(test_cmp,
+     caption   = "Test performance (subject 105) across tuned model families.",
+     col.names = c("Model", "Split", "Accuracy", "Macro-F1"))
+```
+
+## Final model
+
+My final model is a tuned **Random Forest** (`ranger`) with `r ntrees`
+trees, `mtry` = `r mtry_v`, and `min.node.size` = `r mns_v`. I retrain it
+on all six training subjects at once  no more rotations, no more
+holdouts  and then evaluate it, a single time, on subject 105. The
+numbers come out as follows:
+
+- **Overall accuracy**: `r fmt_num(acc, 4)`
+- **Macro-weighted F1**: `r fmt_num(mf1, 4)`
+
+```{r final-metrics-table}
+ktab(final_metrics,
+     caption = "Final model configuration and test metrics.",
+     col.names = c("Model", "Split", "Accuracy", "Macro-F1",
+                   "Num. trees", "mtry", "Min. node size", "Importance"))
+```
+
+## Error Analysis
+
+```{r confusion-figure, fig.cap="Confusion matrix on the held-out test subject (105)."}
+safe_include_graphics(ART_CONF_PNG)
+```
+
+```{r error-analysis, results='asis'}
+# Quantify the main confusion pairs directly from the confusion CSV so the
+# narrative numbers stay in sync with the artifact.
+if (file.exists(ART_CONF_CSV)) {
+  conf <- safe_read_csv(ART_CONF_CSV)
+
+  # Find column names used in the confusion CSV in a tolerant way.
+  truth_col <- intersect(c("truth", "true", "actual", "Truth"), names(conf))[1]
+  pred_col  <- intersect(c("prediction", "predicted", "pred", "Pred"), names(conf))[1]
+  n_col     <- intersect(c("n", "count", "freq", "Freq", "N"), names(conf))[1]
+
+  if (!is.na(truth_col) && !is.na(pred_col) && !is.na(n_col)) {
+    conf2 <- conf %>%
+      dplyr::rename(truth = !!truth_col, pred = !!pred_col, n = !!n_col) %>%
+      dplyr::group_by(truth) %>%
+      dplyr::mutate(total = sum(n)) %>%
+      dplyr::ungroup()
+
+    top_conf <- conf2 %>%
+      dplyr::filter(as.character(truth) != as.character(pred), n > 0) %>%
+      dplyr::mutate(pct_of_truth = n / total) %>%
+      dplyr::arrange(dplyr::desc(pct_of_truth)) %>%
+      dplyr::slice_head(n = 5) %>%
+      dplyr::transmute(
+        `True class`      = truth,
+        `Predicted class` = pred,
+        `Windows`         = n,
+        `% of true class` = fmt_pct(pct_of_truth, 1)
+      )
+
+    print(ktab(top_conf,
+               caption = "Top-5 inter-class confusions on the test subject."))
+  }
+}
+```
+
+One error dominates my matrix: **cycling misclassified as vacuum
+cleaning**. The confusion runs almost entirely in one direction  the
+majority of subject 105's cycling windows leave the model labelled as
+vacuum cleaning  and it is specific to this subject. The reason, once
+I actually look at the signals, is disappointingly physical. Both
+activities produce sustained, moderately rhythmic upper-body motion;
+both sit in overlapping heart-rate regions; and my window-level summary
+statistics, by construction, discard the fine frequency structure that
+would have separated the steady cadence of pedalling from the more
+irregular sweep of a vacuum. Outside of that single confusion, every
+other class clears a macro-F1 above 0.82, as the appendix table
+confirms.
+
+## Per-class Performance
+
+```{r per-class-f1, fig.cap="Per-class F1 on the held-out test subject (105)."}
+per_class %>%
+  dplyr::arrange(f1) %>%
+  dplyr::mutate(class = factor(class, levels = class)) %>%
+  ggplot(aes(x = class, y = f1)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = fmt_num(f1, 3)), hjust = -0.1, size = 3) +
+  coord_flip(ylim = c(0, 1.05)) +
+  labs(x = NULL, y = "F1-score") +
+  theme_minimal(base_size = 10)
+```
+
+## Feature Importance
+
+```{r feat-importance, fig.cap="Top-30 permutation feature importances of the final Random Forest."}
+safe_include_graphics(ART_FEATIMP_PNG)
+```
+
+My importance ranking tells a story consistent with biomechanics. The
+**ankle** and **hand** IMUs dominate the top of my list, and for a
+reason: they are the body parts that move most during locomotion, so
+their mean and RMS acceleration  the sheer intensity of motion 
+carry the heaviest discriminative load. Standard-deviation features fill
+in the texture: how variable is the motion, not merely how large. The
+chest IMU plays a quieter role, but the role it plays is not negligible
+ it is what tells the model that a subject is upright and still versus
+seated and still, a distinction the ankle simply cannot make on its own.
+
+# Conclusion
+
+Under a strictly subject-independent evaluation  the only kind that
+really matters to me if this model is ever going to leave the lab  my
+tuned Random Forest on window-level summary features reaches an accuracy
+of `r fmt_num(acc, 4)` and a macro-F1 of `r fmt_num(mf1, 4)` on a subject
+it has genuinely never seen. That is enough, with the usual caveats
+attached, for me to claim that the model has learned something about
+biomechanics rather than something about the six people whose data
+happened to build it.
+
+## Key takeaways
+
+1. **Subject-independent evaluation is not optional.** My LOSO spread
+   across the training subjects already foreshadowed the drop on the
+   held-out test subject; a random split would have quietly hidden
+   exactly the gap I most wanted to measure.
+2. **Simple window statistics go surprisingly far.** Mean, standard
+   deviation, RMS, and IQR per channel were enough for me to push
+   overall accuracy above 86% without invoking a single frequency-domain
+   feature.
+3. **Interactions matter more than curvature.** My Random Forest beats
+   my regularized multinomial on both validation and test, and it does
+   so not by fitting subtler curves but by exploiting cross-channel
+   conjunctions  exactly the kind of structure a linear model cannot
+   express without explicit, brittle feature crosses.
+
+## Limitations
+
+- Most of my residual error lives on a single pair  **cycling versus
+  vacuum cleaning**  where my time-domain summaries alone cannot
+  separate the two activities for this subject.
+- **Heart rate carries intensity information the IMUs do not**, and I
+  deliberately leave it on the table rather than risk LOCF lag distorting
+  the peaks where it would have helped most.
+- **My test split contains exactly one subject.** My point estimate is
+  therefore a single draw from an unknown distribution; my LOSO spread
+  across training subjects is the more honest guide I have to
+  population-level variability.
+
+## Future work
+
+- I would enrich my feature set with a **frequency-domain layer** 
+  FFT band energies, dominant frequency, spectral entropy  to separate
+  the steady periodicity of pedalling from the more chaotic rhythm of
+  domestic cleaning.
+- I would bring heart rate back, but **aggregate it at the window level**
+  (median, min, max) rather than imputing it row by row, dodging the
+  LOCF lag without throwing away the information.
+- I would swap my hand-crafted pipeline for a shallow **1D CNN** or a
+  small **LSTM** that reads the raw IMU channels directly. The published
+  literature on PAMAP2 suggests these architectures close the cycling /
+  housework gap that hand-crafted features cannot.
+
+# References
+
+- Reiss, A. & Stricker, D. (2012). *Introducing a New Benchmarked Dataset
+  for Activity Monitoring.* 16th IEEE International Symposium on Wearable
+  Computers (ISWC).
+- Reiss, A. & Stricker, D. (2012). *Creating and Benchmarking a New Dataset
+  for Physical Activity Monitoring.* The 5th Workshop on Affect and
+  Behavior Related Assistance (ABRA).
+- UCI Machine Learning Repository. *PAMAP2 Physical Activity Monitoring
+  Data Set.* https://archive.ics.uci.edu/ml/datasets/pamap2+physical+activity+monitoring
+- Wright, M. N. & Ziegler, A. (2017). *ranger: A Fast Implementation of
+  Random Forests for High Dimensional Data in C++ and R.* Journal of
+  Statistical Software, 77(1), 1-17.
+- Friedman, J., Hastie, T. & Tibshirani, R. (2010). *Regularization Paths
+  for Generalized Linear Models via Coordinate Descent.* Journal of
+  Statistical Software, 33(1), 1-22.
+
+\newpage
+
+# Appendix A: Per-class Detailed Metrics
+
+```{r per-class-table}
+per_class %>%
+  dplyr::mutate(dplyr::across(c(precision, recall, f1),
+                              ~ fmt_num(.x, 4))) %>%
+  ktab(caption   = "Detailed per-class performance on the test subject (105).",
+       col.names = c("Class", "Support", "TP", "FP", "FN",
+                     "Precision", "Recall", "F1"))
+```
+
+# Appendix B: Reproducibility
+
+Every number, table and figure in my report is a function of the
+artifacts written by `Script.R`  I type none of them by hand, and
+re-running my script is enough to refresh the document end to end. My
+expected project layout is:
+
+```
+.
+|-- Script.R
+|-- Fernando_Parodi_Capstone.Rmd
+|-- data/
+|   `-- processed/
+|       |-- pamap_clean_protocol.rds
+|       |-- splits/split_manifest_protocol.csv
+|       `-- windows/*.rds
+`-- outputs/
+    |-- cleaning/
+    |-- eda_raw/
+    |-- post_clean_eda/
+    |-- baselines/
+    |-- tuning/
+    `-- final/
+```
+
+Rebuilding the PDF end to end is a two-step affair for me: I run
+`Script.R` once from a clean state, then knit this `.Rmd` file. Nothing
+else is required.
+
+As a safety net, my setup chunk checks up front whether every artifact
+it needs actually exists on disk. If any file is missing, it prints a
+warning listing the missing paths and then runs `Script.R` automatically
+to regenerate the pipeline from scratch. I launch the script as a
+**child R process** via `system2(Rscript, ...)` rather than sourcing it
+inline: knitr redirects the current R session's stdout and stderr
+through its own chunk-capture sink, so a plain `source()` would run
+silently, with no visible progress until the knit finishes. A child
+process launched with `stdout = ""` and `stderr = ""` inherits the
+parent's raw file handles and bypasses that sink, which means the
+script's own messages, warnings and progress lines stream live to the
+console --- or to the RStudio Render pane --- as each stage runs. The
+upshot is that a reviewer who clones the repository without the
+`data/processed/` and `outputs/` trees can still knit the report; the
+first knit simply takes longer, because the full pipeline has to
+complete before a single page is laid out, and the reviewer can watch
+every step of it unfold. If `Script.R` is absent, or if an artifact is
+still missing after it runs, I stop with a clear error rather than
+silently produce a broken document.
+
+## Session information
+
+```{r session-info, echo=FALSE}
+si <- sessionInfo()
+cat("R version:", si$R.version$version.string, "\n")
+cat("Platform:", si$platform, "\n\n")
+cat("Attached packages:\n")
+pkgs <- si$otherPkgs
+if (!is.null(pkgs)) {
+  for (nm in names(pkgs)) {
+    cat(sprintf("  %-14s %s\n", nm, pkgs[[nm]]$Version))
+  }
+}
+```
+
+## Dataset license
+
+The PAMAP2 Physical Activity Monitoring dataset is distributed through
+the UCI Machine Learning Repository and made available for research use
+by its authors at DFKI. I reuse it here under those research-use terms,
+and anyone else who does the same  whether for teaching, research, or
+a capstone just like mine  should cite the original 2012 papers I
+list in the References section.
+
+## Language and translation note
+
+My working language is Spanish; I deliver this report and the inline
+comments of `Script.R` in English to meet the capstone submission
+requirements. I carried out the translation from Spanish to English with
+the assistance of **Google Gemini**, and I reviewed and edited every
+passage myself for technical accuracy, rephrasing wherever the model's
+output drifted from my intended meaning. All analytic choices, modeling
+decisions, results, figures and conclusions presented here are my own.

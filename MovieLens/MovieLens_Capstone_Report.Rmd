@@ -1,0 +1,385 @@
+---
+title: "HarvardX PH125.9x — MovieLens Capstone"
+author: "Fernando Marcelo Parodi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document: 
+    df_print: kable
+    toc: yes
+    fig_caption: yes
+    includes:
+      in_header: preamble.tex
+  html_document: default
+fontsize: 11pt
+include-before: '`\newpage{}`{=latex}'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align="center", out.width="100%")
+set.seed(1)
+library(tidyverse) 
+library(caret) 
+library(lubridate) 
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2) 
+library(scales)
+library(gridExtra)
+library(forcats)
+library(tibble)
+library(readr)
+library(knitr)
+
+```
+\newpage
+# Executive Summary
+
+This project successfully developed a predictive recommendation system for the MovieLens 10M dataset, achieving the stringent RMSE target of < 0.86490. The core approach was an additive effects model that progressively decomposed the overall rating variance into four empirical biases: Movie Appeal ($b_i$), User Tendency ($b_u$), Genre Preference ($b_g$), and Review Date Drift ($b_t$). The final model utilized Penalized Least Squares (Regularization), with the optimal strength ($lambda=5.15$) tuned exclusively on the edx development set. This methodology ensured strict separation between the tuning process and the final, single evaluation on the held-out final_holdout_test set. The final model achieved an Official Validation RMSE of 0.86430.
+
+**Key decisions**:
+
+- Keep the model easy to read and progressive (effects for items, users, genres, and time).
+- une lambda via a coarse-to-fine grid using an internal split of **edx** only.
+- Avoid any use of **final_holdout_test** for training or tuning (strict separation).
+
+
+```{r data-load}
+
+# Use the saved splits produced by the pipeline script if available.
+if (file.exists("edx.rds") && file.exists("final_holdout_test.rds")) {
+  edx <- readRDS("edx.rds")
+  final_holdout_test <- readRDS("final_holdout_test.rds")
+} else {
+  # Fallback: rebuild from raw files if needed (slower).
+  zip_path <- "ml-10M100K.zip"
+  if (!file.exists(zip_path)) {
+    download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", zip_path, mode = "wb")
+  }
+  ratings_path <- "ml-10M100K/ratings.dat"
+  movies_path  <- "ml-10M100K/movies.dat"
+  if (!file.exists(ratings_path)) unzip(zip_path, files = ratings_path)
+  if (!file.exists(movies_path))  unzip(zip_path, files = movies_path)
+  ratings <- as.data.frame(stringr::str_split(readr::read_lines(ratings_path), stringr::fixed("::"), simplify = TRUE),
+                           stringsAsFactors = FALSE)
+  colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+  ratings <- ratings %>% mutate(userId = as.integer(userId),
+                                movieId = as.integer(movieId),
+                                rating = as.numeric(rating),
+                                timestamp = as.integer(timestamp))
+  movies <- as.data.frame(stringr::str_split(readr::read_lines(movies_path), stringr::fixed("::"), simplify = TRUE),
+                          stringsAsFactors = FALSE)
+  colnames(movies) <- c("movieId", "title", "genres")
+  movies <- movies %>% mutate(movieId = as.integer(movieId))
+  movielens <- left_join(ratings, movies, by = "movieId")
+  # Build edx / final_holdout_test (10%)
+  set.seed(1)
+  idx <- createDataPartition(movielens$rating, p = 0.1, list = FALSE)
+  edx <- movielens[-idx, ]; temp <- movielens[idx, ]
+  final_holdout_test <- temp %>% semi_join(edx, by="movieId") %>% semi_join(edx, by="userId")
+  removed <- anti_join(temp, final_holdout_test,
+                       by=c("userId","movieId","rating","timestamp","title","genres"))
+  edx <- bind_rows(edx, removed)
+  rm(movielens, idx, temp, removed, ratings, movies)
+}
+#dim(edx); dim(final_holdout_test)
+```
+\newpage
+# **Exploratory Data Analysis**
+
+In this analysis, **edx** (a `r class(edx)`) has `r format(nrow(edx), big.mark = ",", scientific = FALSE)` rows and `r format(ncol(edx), big.mark = ",", scientific = FALSE)` columns. The Cartesian product of users and movies would yield approximately `r round((dplyr::n_distinct(edx$userId) * dplyr::n_distinct(edx$movieId)) / 1e6)` million possible ratings; the gap to the actual row count highlights substantial sparsity.
+
+## **Data model**
+
+The MovieLens 10M dataset is composed of two source files:
+
+- `ratings.dat`: `(userId, movieId, rating, timestamp)` — one row per user–movie rating event.  
+- `movies.dat`: `(movieId, title, genres)` — movie metadata; `genres` is a pipe‐separated list.
+
+After joining on `movieId`, the working table used in this analysis contains:
+
+- `userId` (integer): unique user identifier.  
+- `movieId` (integer): unique movie identifier.  
+- `rating` (numeric): explicit rating in {0.5, 1.0, …, 5.0}.  
+- `timestamp` (integer): Unix time for the rating event.  
+- `title` (character): movie title (often includes year in parentheses).  
+- `genres` (character): one or more genres separated by `|` (e.g., `"Drama|Romance"`).  
+
+Engineered variables created later for modeling/EDA include a weekly time key (`week`) and atomic genre labels (exploding `genres`).
+
+```{r data-model-overview}
+
+# Dataset dimensions
+n_ratings <- nrow(edx)
+n_users   <- dplyr::n_distinct(edx$userId)
+n_movies  <- dplyr::n_distinct(edx$movieId)
+
+knitr::kable(
+  tibble::tibble(
+    metric = c("Rows (ratings)", "Unique users", "Unique movies"),
+    value  = c(n_ratings, n_users, n_movies)
+  ),
+  caption = "High-level dataset dimensions"
+)
+```
+\newpage
+
+## **Ratings** / **Global mean**
+The overall average rating in the dataset ($mu$) was found to be approximately 3.51. Starting with this global mean as a baseline yielded an RMSE of 1.060. This high initial error immediately signals that predicting accurately requires accounting for systematic deviations from the mean, necessitating the inclusion of additional empirical effects.
+
+```{r eda-1 - ratings, fig.pos="H", fig.cap="Distribution of Ratings"} 
+mu_hat <- mean(edx$rating)
+
+# Rating Distribution
+ggplot(edx, aes(rating)) +
+  geom_histogram(binwidth = 0.5, center = 0.5,
+                 fill="#2196F3", color = "grey30") +
+  stat_bin(binwidth = 0.5, center = 0.5,
+           geom = "text",
+           aes(label = label_number(accuracy = 0.1,
+                                    scale_cut = cut_si(" "))(after_stat(count))),
+           vjust = -0.3, size = 3) +
+  scale_x_continuous(breaks = seq(0.5, 5, 0.5)) +
+  scale_y_continuous(labels = label_number(accuracy = 0.1,
+                                           scale_cut = cut_si(" ")),
+                     expand = expansion(mult = c(0, .08))) +
+  geom_vline(xintercept = mu_hat, color = "red", linetype = "dashed", linewidth=0.5) +
+  labs(title = "Distribution of Ratings",
+       x = "Rating", y = "Number of Rating") +
+  theme_minimal()
+
+```
+\newpage
+
+## **Movies** ($movieId$) - **Users** ($userId$)
+
+Ratings are uneven across titles: the most-rated film — `r edx %>% count(title, name = "n") %>% slice_max(n, n = 1, with_ties = FALSE) %>% pull(title)` — has `r format(edx %>% count(title, name = "n") %>% slice_max(n, n = 1, with_ties = FALSE) %>% pull(n), big.mark = ",", scientific = FALSE)` ratings, while `r format(edx %>% count(movieId) %>% filter(n == 1) %>% nrow(), big.mark = ",", scientific = FALSE)` movies are rated only once; this motivates a movie-specific bias (`b_i`). User activity is similarly skewed: the most active user submitted `r format(edx %>% count(userId, name = "n") %>% slice_max(n, n = 1, with_ties = FALSE) %>% pull(n), big.mark = ",", scientific = FALSE)` ratings, whereas `r format(edx %>% count(userId, name = "n") %>% filter(n < 10) %>% nrow(), big.mark = ",", scientific = FALSE)` users recorded fewer than 10; a user bias (`b_u`) accounts for these tendencies.
+
+```{r eda-2 - movie_user, fig.pos="H", fig.cap="Variation average rating per movie $(b_i)$ / user $(b_u)$", fig.show='hold', out.width='100%'}
+# 1. Create the Movie Plot (p_movie)
+p_movie <- edx %>% 
+  group_by(movieId) %>%
+  summarize(ave_rating = mean(rating)) %>%
+  ggplot(aes(ave_rating)) +
+  geom_histogram(bins=30, fill="#2196F3", color = "grey30") +
+  geom_vline(xintercept = mu_hat, color = "red", linetype = "dashed", linewidth=1) +
+  labs(title = "Dist. Average Movie Ratings", 
+       x = "Average Rating", 
+       y = "Number of Movies (Count)",
+       subtitle = paste("Global Average Rating (mu):", round(mu_hat, 4)) +
+         theme_minimal())
+
+# 2. Create the User Plot (p_user)
+p_user <- edx %>% 
+  group_by(userId) %>%
+  summarize(ave_rating = mean(rating)) %>%
+  ggplot(aes(ave_rating)) +
+  geom_histogram(bins=30, fill="#4CAF50", color = "grey30") +
+  geom_vline(xintercept = mu_hat, color = "red", linetype = "dashed", linewidth=1) +
+  labs(title = "Dist. Average User Ratings", 
+       x = "Average Rating", 
+       y = "Number of Users (Count)")
+
+# 3. Combine and Display the Plots
+grid.arrange(p_movie, p_user, ncol=2)
+```
+\newpage
+
+## Movie Genre ($genres)  
+```{r eda-3 - genre}
+
+genre_stats50k <- edx %>%
+  group_by(genres) %>%
+  summarise(n = n(), avg = mean(rating), .groups = "drop") %>%
+  filter(n >= 50000)
+
+best_g  <- genre_stats50k %>% slice_max(avg, n = 1, with_ties = FALSE)
+worst_g <- genre_stats50k %>% slice_min(avg, n = 1, with_ties = FALSE)
+```
+**Genre differences.** Mean ratings vary generally across genre combinations.  
+Among groups with at least 50,000 ratings (`r nrow(genre_stats50k)` combinations), the highest mean is `r sprintf('%.2f', best_g$avg)` for `r best_g$genres`, and the lowest is `r sprintf('%.2f', worst_g$avg)` for `r worst_g$genres`.  
+The `r sprintf('%.2f', best_g$avg - worst_g$avg)`-point spread (visible with the 95% CIs in the figure) supports adding a genre bias term `b_g` to the model.
+
+```{r eda-4 - rating-by-genre, fig.pos="H", fig.cap="Average Rating by Genre Combination"}
+# Genres (atomic labels)
+edx %>% 
+  group_by(genres) %>%
+  summarise(n = n(), 
+            avg_rating = mean(rating), 
+            se = sd(rating)/sqrt(n())) %>%
+  filter(n >= 50000) %>% # Filtra combinaciones con menos de 50,000 ratings para legibilidad
+  mutate(genres = reorder(genres, avg_rating)) %>%
+  ggplot(aes(x = genres, y = avg_rating, ymin = avg_rating - 2*se, ymax = avg_rating + 2*se)) +
+  geom_point(color="#2196F3", size=2) +
+  geom_errorbar(width = 0.2, color="#FF9800") +
+  coord_flip() +
+  labs(title = "Average Rating by Genre Combination",
+       subtitle = "Filtered for Genre Combinations with > 50,000 Ratings",
+       x = "Genre Combination", 
+       y = "Average Rating (with 95% CI Error Bars)") +
+  theme(axis.text.y = element_text(size = 8))
+
+
+```
+
+\newpage
+
+## Date of review ($timestamp)
+
+```{r eda-5 - date-of-review"}
+edx_dates <- if ("review_date" %in% names(edx)) edx else
+edx %>% mutate(review_date = round_date(as_datetime(timestamp), unit = "week"))
+
+yearly <- edx_dates %>%
+mutate(year = year(review_date)) %>%
+group_by(year) %>%
+summarise(avg = mean(rating), .groups = "drop")
+
+yr_start <- min(yearly$year)
+avg_start <- yearly %>% filter(year == yr_start) %>% pull(avg)
+yr_trough <- yearly$year[which.min(yearly$avg)]
+avg_trough <- min(yearly$avg)
+yr_end <- max(yearly$year)
+avg_end <- yearly %>% filter(year == yr_end) %>% pull(avg)
+```
+
+Ratings begin in `r yr_start`. The yearly mean drops from `r sprintf('%.2f', avg_start)` to a local low around `r yr_trough` (`r sprintf('%.2f', avg_trough)`), then recovers gradually through `r yr_end` (see Figure 4). The temporal pattern is modest compared with the movie (`b_i`) and user (`b_u`) effects, but it is present, so a time bias term (`b_t`) is included in the model.
+
+
+```{r eda-6 - rating-over-time, fig.cap="Average Rating Over Time (weekly) $(b_t)$"}
+# Time trend (weekly)
+edx %>%
+  mutate(week = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(week) %>% 
+  summarise(avg = mean(rating), .groups = "drop") %>%
+  ggplot(aes(week, avg)) + 
+  geom_point(alpha=.3, color="#795548") + # Puntos más transparentes para ver la tendencia
+  geom_smooth(method="loess", span=.2, color="blue", linewidth=1.2) +
+  labs(title="Average Rating Trend Over Time (Weekly)", 
+       x="Date of Review (Week)", 
+       y="Average Rating (Smoothed Trend)") +
+  theme_minimal()
+```
+
+\newpage
+
+# Methods and Modeling
+
+
+## Splitting edx out into train and test sets
+
+This crucial first step established the internal tuning environment. The edx set was split into a 90% training partition (train_set) and a 10% test partition (test_set). The use of semi_join was a strict measure to guarantee that every movie and user present in the test_set had at least one observation in the train_set, thereby avoiding the "Cold Start" problem during development and ensuring meaningful RMSE calculations
+
+## Developing the Algorithm (Progressive Bias)
+
+The algorithm was built progressively by introducing one additive effect at a time. This step-by-step approach not only simplifies the model but also empirically measures the contribution of each factor to the total error reduction. The most significant performance jump was observed upon the inclusion of the $b_u$ (User) term, confirming that individual rating habit is the dominant source of residual variation after accounting for the inherent quality of the film ($b_i$).
+
+## Regularising the algorithm
+
+Regularization was the critical final step required to enhance the model's generalizability and prevent overfitting. By applying a penalty\(
+\hat{b} = \frac{\sum \text{residual}}{n + \lambda}
+\) to the magnitude of the effect estimates, regularization shrinks estimates that are based on small sample sizes (noisy data) toward the population mean. This is crucial for improving out-of-sample prediction. The optimal $lambda$ was determined via cross-validation, where the model was tested across a sequence of lambda values to find the one that minimized the RMSE on the internal test_set. The value $\mathbf{lambda = 5.15}$ was identified as the optimal balance point between bias and variance.
+
+
+```{r modeling, results='hide'}
+# Reuse the stand-alone pipeline if desired
+source("Script.R", local = TRUE)
+```
+
+```{r regularization-curve, fig.cap="Selecting the Optimal Tuning Parameter (Lambda) via Coarse and Fine Grid Search", fig.pos="H"}
+
+# 1. Combine the coarse and fine grid results into a single tibble for plotting
+# The 'grid' variable distinguishes between the initial search and the fine-tuning.
+rmse_tuning_data <- tibble(
+    lambda = c(lambdas_coarse, lambdas_fine),
+    rmse   = c(rmses_coarse,   rmses_fine),
+    grid   = c(rep("Coarse Search", length(lambdas_coarse)),
+               rep("Fine Tuning", length(lambdas_fine)))
+  ) %>%
+  # Filter to show only unique points, prioritizing the fine-tuning results
+  distinct(lambda, .keep_all = TRUE)
+
+# 2. Generate the plot
+rmse_tuning_data %>%
+  ggplot(aes(lambda, rmse, color = grid)) +
+  geom_point(size = 1.5, alpha = 0.8, color="#2196F3") +
+  geom_line(alpha = 0.6, color = "#2196F3") +
+  
+  # Highlight the final optimal lambda* (5.15)
+  geom_vline(xintercept = lambda_star, linetype = "dashed", color = "#4CAF50") +
+  
+  # Add annotation for lambda* value
+  annotate("text", x = lambda_star + 0.3, y = min(rmse_tuning_data$rmse) + 0.00005, 
+           label = paste("Lambda * =", round(lambda_star, 3)), 
+           color = "#4CAF50", fontface = "bold") +
+  
+  labs(title = "RMSE vs. Lambda (Regularization Optimization)",
+       x = expression(paste("Regularization Parameter ", lambda)),
+       y = "RMSE (Internal Test Set)",
+       color = "Search Grid") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+\newpage
+
+# **Results**
+
+The internal split inside **edx** shows monotonic improvement as effects are added, followed by a further reduction in RMSE after regularization. Finally, the model trained on the full **edx** with the tuned `lambda*` is evaluated once on the **final_holdout_test**.
+
+```{r results}
+if (file.exists("outputs/rmse_summary.rds")) {
+  rmse_results <- readRDS("outputs/rmse_summary.rds")
+  rmse_results %>% arrange(RMSE)
+}
+```
+
+```{r final-rmse-display, echo=FALSE, message=FALSE, warning=FALSE}
+
+rmse_objective <- get0("rmse_objective", ifnotfound = 0.86490)
+
+if (file.exists("outputs/rmse_official.txt")) {
+  rmse_official <- parse_number(read_file("outputs/rmse_official.txt"))
+
+  final_results <- tibble(
+    Method = c("Project objective", "Validation of latest model"),
+    RMSE = c(rmse_objective, rmse_official),
+    `final vs objective` = c(NA_real_, rmse_official - rmse_objective)
+  ) %>%
+    mutate(
+      RMSE = sprintf("%.5f", RMSE),
+      `final vs objective` = ifelse(is.na(`final vs objective`), "-", sprintf("%.5f", `final vs objective`))
+  )
+  kable(
+    final_results,
+    align = c("l", "r", "r"),
+    booktabs = knitr::is_latex_output(),
+    caption = "Official RMSE on final_holdout_test."
+  )
+} else {
+  cat("Official RMSE file not found. Run the pipeline script to generate 'outputs/rmse_official.txt'.")
+}
+```
+\newpage
+ 
+## Conclusion
+
+- The incremental effects address major sources of bias: movie popularity (`b_i`) and user strictness (`b_u`).  
+- Regularization reduces variance for movies and users with few ratings, improving generalization.  
+- Genre and time effects provide small but consistent gains by capturing structural patterns in the data.  
+- The strict separation between tuning and final evaluation prevents leakage and aligns with the project instructions.
+
+## Limitations and Future Work
+
+The primary constraint of this final model is its linearity. By design, the additive effects model does not capture complex, non-linear user-item interactions (e.g., a specific user who hates only sci-fi directed by filmmaker X). This results in a residual error that is not truly independent. Future work should focus on Matrix Factorization techniques (e.g., Funk SVD). This approach would decompose the residual error into latent features (unseen characteristics of movies and users) and is significantly more scalable and memory-efficient for real-world production environments than the linear bias model presented here.  
+
+# **Reproducibility Notes**
+
+* **Code:** The R code used in this project is fully reproducible and contained in the attached Script.R file.
+* **Translation:** All English translations within this report were conducted using the Gemini Large Language Model (Google, 2024).
+
+\newpage
+
+```{r session-info}
+sessionInfo()
+```
