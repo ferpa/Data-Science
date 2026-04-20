@@ -1,0 +1,2 @@
+model,split,accuracy,macro_f1,num_trees,mtry,min_node_size,importance
+ranger_rf_final_dev,test,0.8684891023272996,0.8580144042671389,400,14,1,permutation

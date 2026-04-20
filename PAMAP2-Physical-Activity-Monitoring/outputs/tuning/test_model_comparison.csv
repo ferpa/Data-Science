@@ -1,0 +1,3 @@
+model,split,accuracy,macro_f1
+ranger_rf_tuned,test,0.8854820834872552,0.8810514628827699
+glmnet_tuned,test,0.837458441078685,0.8382189603616778
